@@ -200,6 +200,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             permission_mode,
             output_format,
         } => print_status_snapshot(&model, permission_mode, output_format)?,
+        CliAction::ConfigShow { output_format } => print_config_json(output_format)?,
         CliAction::Sandbox { output_format } => print_sandbox_status_snapshot(output_format)?,
         CliAction::Prompt {
             prompt,
@@ -295,6 +296,9 @@ enum CliAction {
         output_format: CliOutputFormat,
     },
     Sandbox {
+        output_format: CliOutputFormat,
+    },
+    ConfigShow {
         output_format: CliOutputFormat,
     },
     Prompt {
@@ -536,6 +540,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
             args: join_optional_args(&rest[1..]),
             output_format,
         }),
+        "config" => parse_config_args(&rest[1..], output_format),
         "mcp" => Ok(CliAction::Mcp {
             args: join_optional_args(&rest[1..]),
             output_format,
@@ -624,7 +629,7 @@ fn parse_single_word_command_alias(
     permission_mode_override: Option<PermissionMode>,
     output_format: CliOutputFormat,
 ) -> Option<Result<CliAction, String>> {
-    if rest.len() != 1 || rest[0] == "branch" {
+    if rest.len() != 1 || matches!(rest[0].as_str(), "branch" | "config") {
         return None;
     }
 
@@ -649,6 +654,7 @@ fn bare_slash_command_guidance(command_name: &str) -> Option<String> {
         "dump-manifests"
             | "bootstrap-plan"
             | "agents"
+            | "config"
             | "mcp"
             | "skills"
             | "system-prompt"
@@ -1089,7 +1095,16 @@ fn parse_export_args(args: &[String], output_format: CliOutputFormat) -> Result<
     })
 }
 
-fn parse_resume_args(args: &[String], output_format: CliOutputFormat) -> Result<CliAction, String> {
+fn parse_config_args(args: &[String], output_format: CliOutputFormat) -> Result<CliAction, String> {
+    match args {
+        [] => Err("Usage: claw config show".to_string()),
+        [action] if action == "show" => Ok(CliAction::ConfigShow { output_format }),
+        [action, ..] => Err(format!(
+            "unknown config action: {action}. Usage: claw config show"
+        )),
+    }
+}
+
 fn parse_branch_args(args: &[String]) -> Result<CliAction, String> {
     match args {
         [] => Err("Usage: claw branch delete".to_string()),
@@ -1099,6 +1114,8 @@ fn parse_branch_args(args: &[String]) -> Result<CliAction, String> {
         )),
     }
 }
+
+fn parse_resume_args(args: &[String], output_format: CliOutputFormat) -> Result<CliAction, String> {
     let (session_path, command_tokens): (PathBuf, &[String]) = match args.first() {
         None => (PathBuf::from(LATEST_SESSION_REFERENCE), &[]),
         Some(first) if looks_like_slash_command_token(first) => {
@@ -4977,6 +4994,19 @@ fn print_help_topic(topic: LocalHelpTopic) {
     println!("{}", render_help_topic(topic));
 }
 
+fn print_config_json(_output_format: CliOutputFormat) -> Result<(), Box<dyn std::error::Error>> {
+    println!("{}", render_merged_runtime_config_json()?);
+    Ok(())
+}
+
+fn render_merged_runtime_config_json() -> Result<String, Box<dyn std::error::Error>> {
+    let cwd = env::current_dir()?;
+    let loader = ConfigLoader::default_for(&cwd);
+    let runtime_config = loader.load()?;
+    let parsed: serde_json::Value = serde_json::from_str(&runtime_config.as_json().render())?;
+    Ok(serde_json::to_string_pretty(&parsed)?)
+}
+
 fn render_config_report(section: Option<&str>) -> Result<String, Box<dyn std::error::Error>> {
     let cwd = env::current_dir()?;
     let loader = ConfigLoader::default_for(&cwd);
@@ -7833,6 +7863,8 @@ fn print_help_to(out: &mut impl Write) -> io::Result<()> {
         out,
         "      Show the current local workspace status snapshot"
     )?;
+    writeln!(out, "  claw config show")?;
+    writeln!(out, "      Print the merged runtime config as JSON")?;
     writeln!(out, "  claw sandbox")?;
     writeln!(out, "      Show the current sandbox isolation snapshot")?;
     writeln!(out, "  claw doctor")?;
@@ -7932,6 +7964,7 @@ fn print_help_to(out: &mut impl Write) -> io::Result<()> {
         out,
         "  claw --resume {LATEST_SESSION_REFERENCE} /status /diff /export notes.txt"
     )?;
+    writeln!(out, "  claw config show")?;
     writeln!(out, "  claw branch delete")?;
     writeln!(out, "  claw agents")?;
     writeln!(out, "  claw mcp show my-server")?;
@@ -7976,15 +8009,17 @@ mod tests {
         format_unknown_slash_command_message, format_user_visible_api_error, git_ref_exists_in,
         merge_prompt_with_stdin, normalize_permission_mode, parse_args, parse_export_args,
         parse_git_status_branch, parse_git_status_metadata_for, parse_git_workspace_summary,
-        parse_history_count, permission_policy, print_help_to, push_output_block,
-        render_config_report, render_diff_report, render_diff_report_for, render_memory_report,
+        parse_git_worktrees, parse_history_count, parse_recent_commits, permission_policy,
+        print_help_to, push_output_block, render_config_report, render_diff_report,
+        render_diff_report_for, render_memory_report, render_merged_runtime_config_json,
         render_prompt_history_report, render_repl_help, render_resume_usage,
         render_session_markdown, resolve_model_alias, resolve_model_alias_with_config,
         resolve_repl_model, resolve_session_reference, response_to_events,
         resume_supported_slash_commands, run_resume_command, short_tool_id,
         slash_command_completion_candidates_with_sessions, status_context,
         summarize_tool_payload_for_markdown, validate_no_args, write_mcp_server_fixture, CliAction,
-        CliOutputFormat, CliToolExecutor, GitWorkspaceSummary, InternalPromptProgressEvent,
+        CliOutputFormat, CliToolExecutor, GitBranchFreshness, GitCommitEntry,
+        GitWorkspaceSummary, GitWorktreeEntry, InternalPromptProgressEvent,
         InternalPromptProgressState, LiveCli, LocalHelpTopic, PromptHistoryEntry, SlashCommand,
         StatusUsage, DEFAULT_MODEL, LATEST_SESSION_REFERENCE,
     };
@@ -8940,6 +8975,19 @@ mod tests {
             .expect_err("unknown branch action should fail");
         assert!(unknown_error.contains("unknown branch action: prune"));
         assert!(unknown_error.contains("Usage: claw branch delete"));
+    }
+    #[test]
+    fn parses_config_show_subcommand() {
+        assert_eq!(
+            parse_args(&["config".to_string(), "show".to_string()])
+                .expect("config show should parse"),
+            CliAction::ConfigShow {
+                output_format: CliOutputFormat::Text,
+            }
+        );
+
+        let error = parse_args(&["config".to_string()]).expect_err("missing action should fail");
+        assert!(error.contains("Usage: claw config show"));
     }
     fn parses_single_word_command_aliases_without_falling_back_to_prompt_mode() {
         let _guard = env_lock();
@@ -9962,6 +10010,16 @@ mod tests {
     }
 
     #[test]
+    fn merged_runtime_config_json_renders_pretty_valid_json() {
+        let rendered =
+            render_merged_runtime_config_json().expect("runtime config json should render");
+        let parsed: serde_json::Value =
+            serde_json::from_str(&rendered).expect("runtime config json should parse");
+        assert!(parsed.is_object());
+        assert!(rendered.starts_with("{\n") || rendered == "{}");
+    }
+
+    #[test]
     fn memory_report_uses_sectioned_layout() {
         let report = render_memory_report().expect("memory report should render");
         assert!(report.contains("Memory"));
@@ -10291,6 +10349,7 @@ UU conflicted.rs",
         let mut help = Vec::new();
         print_help_to(&mut help).expect("help should render");
         let help = String::from_utf8(help).expect("help should be utf8");
+        assert!(help.contains("claw config show"));
         assert!(help.contains("claw branch delete"));
         assert!(help.contains("claw --resume [SESSION.jsonl|session-id|latest]"));
         assert!(help.contains("Use `latest` with --resume, /resume, or /session switch"));
