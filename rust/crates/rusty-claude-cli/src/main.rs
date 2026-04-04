@@ -201,6 +201,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             output_format,
         } => print_status_snapshot(&model, permission_mode, output_format)?,
         CliAction::ConfigShow { output_format } => print_config_json(output_format)?,
+        CliAction::HookList { output_format } => print_hook_list(output_format)?,
         CliAction::Sandbox { output_format } => print_sandbox_status_snapshot(output_format)?,
         CliAction::Prompt {
             prompt,
@@ -299,6 +300,9 @@ enum CliAction {
         output_format: CliOutputFormat,
     },
     ConfigShow {
+        output_format: CliOutputFormat,
+    },
+    HookList {
         output_format: CliOutputFormat,
     },
     Prompt {
@@ -564,6 +568,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
             }
         }
         "system-prompt" => parse_system_prompt_args(&rest[1..], output_format),
+        "hook" => parse_hook_args(&rest[1..], output_format),
         "login" => Ok(CliAction::Login { output_format }),
         "logout" => Ok(CliAction::Logout { output_format }),
         "init" => Ok(CliAction::Init { output_format }),
@@ -629,7 +634,7 @@ fn parse_single_word_command_alias(
     permission_mode_override: Option<PermissionMode>,
     output_format: CliOutputFormat,
 ) -> Option<Result<CliAction, String>> {
-    if rest.len() != 1 || matches!(rest[0].as_str(), "branch" | "config") {
+    if rest.len() != 1 || matches!(rest[0].as_str(), "branch" | "config" | "hook") {
         return None;
     }
 
@@ -1101,6 +1106,16 @@ fn parse_config_args(args: &[String], output_format: CliOutputFormat) -> Result<
         [action] if action == "show" => Ok(CliAction::ConfigShow { output_format }),
         [action, ..] => Err(format!(
             "unknown config action: {action}. Usage: claw config show"
+        )),
+    }
+}
+
+fn parse_hook_args(args: &[String], output_format: CliOutputFormat) -> Result<CliAction, String> {
+    match args {
+        [] => Err("Usage: claw hook list".to_string()),
+        [action] if action == "list" => Ok(CliAction::HookList { output_format }),
+        [action, ..] => Err(format!(
+            "unknown hook action: {action}. Usage: claw hook list"
         )),
     }
 }
@@ -5007,6 +5022,127 @@ fn render_merged_runtime_config_json() -> Result<String, Box<dyn std::error::Err
     Ok(serde_json::to_string_pretty(&parsed)?)
 }
 
+fn print_hook_list(_output_format: CliOutputFormat) -> Result<(), Box<dyn std::error::Error>> {
+    let cwd = env::current_dir()?;
+    let loader = ConfigLoader::default_for(&cwd);
+    let runtime_config = loader.load()?;
+    println!(
+        "{}",
+        render_hook_list_report_for(&cwd, &loader, &runtime_config)?
+    );
+    Ok(())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct HookListEntry {
+    source: String,
+    event: &'static str,
+    command: String,
+    enabled: bool,
+}
+
+fn render_hook_list_report_for(
+    cwd: &Path,
+    loader: &ConfigLoader,
+    runtime_config: &runtime::RuntimeConfig,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let entries = collect_hook_list_entries(cwd, loader, runtime_config)?;
+    let enabled_count = entries.iter().filter(|entry| entry.enabled).count();
+    let mut lines = vec![format!(
+        "Hooks\n  Registered       {}\n  Enabled          {}",
+        entries.len(),
+        enabled_count
+    )];
+
+    if entries.is_empty() {
+        lines.push("  No hooks registered.".to_string());
+        return Ok(lines.join("\n"));
+    }
+
+    lines.push("Entries".to_string());
+    lines.push(format!(
+        "  {:<7} {:<32} {:<19} {}",
+        "Enabled", "Source", "Event", "Command"
+    ));
+
+    for entry in entries {
+        lines.push(format!(
+            "  {:<7} {:<32} {:<19} {}",
+            if entry.enabled { "yes" } else { "no" },
+            entry.source,
+            entry.event,
+            entry.command
+        ));
+    }
+
+    Ok(lines.join("\n"))
+}
+
+fn collect_hook_list_entries(
+    cwd: &Path,
+    loader: &ConfigLoader,
+    runtime_config: &runtime::RuntimeConfig,
+) -> Result<Vec<HookListEntry>, Box<dyn std::error::Error>> {
+    let mut entries = Vec::new();
+    extend_hook_list_entries(
+        &mut entries,
+        "config".to_string(),
+        true,
+        runtime_config.hooks().pre_tool_use(),
+        runtime_config.hooks().post_tool_use(),
+        runtime_config.hooks().post_tool_use_failure(),
+    );
+
+    let plugin_manager = build_plugin_manager(cwd, loader, runtime_config);
+    let plugin_registry = plugin_manager.plugin_registry()?;
+    for plugin in plugin_registry.plugins() {
+        extend_hook_list_entries(
+            &mut entries,
+            format!("plugin:{}", plugin.metadata().id),
+            plugin.is_enabled(),
+            &plugin.hooks().pre_tool_use,
+            &plugin.hooks().post_tool_use,
+            &plugin.hooks().post_tool_use_failure,
+        );
+    }
+
+    Ok(entries)
+}
+
+fn extend_hook_list_entries(
+    entries: &mut Vec<HookListEntry>,
+    source: String,
+    enabled: bool,
+    pre_tool_use: &[String],
+    post_tool_use: &[String],
+    post_tool_use_failure: &[String],
+) {
+    append_hook_list_entries(entries, &source, enabled, "PreToolUse", pre_tool_use);
+    append_hook_list_entries(entries, &source, enabled, "PostToolUse", post_tool_use);
+    append_hook_list_entries(
+        entries,
+        &source,
+        enabled,
+        "PostToolUseFailure",
+        post_tool_use_failure,
+    );
+}
+
+fn append_hook_list_entries(
+    entries: &mut Vec<HookListEntry>,
+    source: &str,
+    enabled: bool,
+    event: &'static str,
+    commands: &[String],
+) {
+    entries.extend(commands.iter().cloned().map(|command| HookListEntry {
+        source: source.to_string(),
+        event,
+        command,
+        enabled,
+    }));
+}
+
 fn render_config_report(section: Option<&str>) -> Result<String, Box<dyn std::error::Error>> {
     let cwd = env::current_dir()?;
     let loader = ConfigLoader::default_for(&cwd);
@@ -7865,6 +8001,11 @@ fn print_help_to(out: &mut impl Write) -> io::Result<()> {
     )?;
     writeln!(out, "  claw config show")?;
     writeln!(out, "      Print the merged runtime config as JSON")?;
+    writeln!(out, "  claw hook list")?;
+    writeln!(
+        out,
+        "      Show registered hooks and whether they are enabled"
+    )?;
     writeln!(out, "  claw sandbox")?;
     writeln!(out, "      Show the current sandbox isolation snapshot")?;
     writeln!(out, "  claw doctor")?;
@@ -7965,6 +8106,7 @@ fn print_help_to(out: &mut impl Write) -> io::Result<()> {
         "  claw --resume {LATEST_SESSION_REFERENCE} /status /diff /export notes.txt"
     )?;
     writeln!(out, "  claw config show")?;
+    writeln!(out, "  claw hook list")?;
     writeln!(out, "  claw branch delete")?;
     writeln!(out, "  claw agents")?;
     writeln!(out, "  claw mcp show my-server")?;
@@ -8009,13 +8151,13 @@ mod tests {
         format_unknown_slash_command_message, format_user_visible_api_error, git_ref_exists_in,
         merge_prompt_with_stdin, normalize_permission_mode, parse_args, parse_export_args,
         parse_git_status_branch, parse_git_status_metadata_for, parse_git_workspace_summary,
-        parse_git_worktrees, parse_history_count, parse_recent_commits, permission_policy,
-        print_help_to, push_output_block, render_config_report, render_diff_report,
-        render_diff_report_for, render_memory_report, render_merged_runtime_config_json,
-        render_prompt_history_report, render_repl_help, render_resume_usage,
-        render_session_markdown, resolve_model_alias, resolve_model_alias_with_config,
-        resolve_repl_model, resolve_session_reference, response_to_events,
-        resume_supported_slash_commands, run_resume_command, short_tool_id,
+        parse_git_worktrees, parse_history_count, parse_hook_args, parse_recent_commits,
+        permission_policy, print_help_to, push_output_block, render_config_report,
+        render_diff_report, render_diff_report_for, render_hook_list_report_for,
+        render_memory_report, render_merged_runtime_config_json, render_prompt_history_report,
+        render_repl_help, render_resume_usage, render_session_markdown, resolve_model_alias,
+        resolve_model_alias_with_config, resolve_repl_model, resolve_session_reference,
+        response_to_events, resume_supported_slash_commands, run_resume_command, short_tool_id,
         slash_command_completion_candidates_with_sessions, status_context,
         summarize_tool_payload_for_markdown, validate_no_args, write_mcp_server_fixture, CliAction,
         CliOutputFormat, CliToolExecutor, GitBranchFreshness, GitCommitEntry,
@@ -8989,6 +9131,23 @@ mod tests {
         let error = parse_args(&["config".to_string()]).expect_err("missing action should fail");
         assert!(error.contains("Usage: claw config show"));
     }
+    #[test]
+    fn parses_hook_list_subcommand() {
+        assert_eq!(
+            parse_args(&["hook".to_string(), "list".to_string()]).expect("hook list should parse"),
+            CliAction::HookList {
+                output_format: CliOutputFormat::Text,
+            }
+        );
+
+        let error = parse_args(&["hook".to_string()]).expect_err("missing action should fail");
+        assert!(error.contains("Usage: claw hook list"));
+
+        let error = parse_hook_args(&["run".to_string()], CliOutputFormat::Text)
+            .expect_err("unknown action should fail");
+        assert!(error.contains("unknown hook action: run"));
+        assert!(error.contains("Usage: claw hook list"));
+    }
     fn parses_single_word_command_aliases_without_falling_back_to_prompt_mode() {
         let _guard = env_lock();
         std::env::remove_var("RUSTY_CLAUDE_PERMISSION_MODE");
@@ -9854,6 +10013,7 @@ mod tests {
         assert!(help.contains("claw help"));
         assert!(help.contains("claw version"));
         assert!(help.contains("claw status"));
+        assert!(help.contains("claw hook list"));
         assert!(help.contains("claw sandbox"));
         assert!(help.contains("claw init"));
         assert!(help.contains("claw agents"));
@@ -10034,6 +10194,49 @@ mod tests {
         assert!(report.contains("Config"));
         assert!(report.contains("Discovered files"));
         assert!(report.contains("Merged JSON"));
+    }
+
+    #[test]
+    fn hook_list_report_shows_config_and_plugin_hooks_with_enabled_state() {
+        let config_home = temp_dir();
+        let workspace = temp_dir();
+        let source_root = temp_dir();
+        fs::create_dir_all(&config_home).expect("config home");
+        fs::create_dir_all(workspace.join(".claw")).expect("workspace config dir");
+        fs::create_dir_all(&source_root).expect("source root");
+        fs::write(
+            workspace.join(".claw").join("settings.json"),
+            r#"{"hooks":{"PostToolUse":["printf 'config post'"]}}"#,
+        )
+        .expect("workspace settings should write");
+        write_plugin_fixture(&source_root, "hook-report-demo", true, false);
+
+        let mut manager = PluginManager::new(PluginManagerConfig::new(&config_home));
+        manager
+            .install(source_root.to_str().expect("utf8 source path"))
+            .expect("plugin install should succeed");
+        manager
+            .disable("hook-report-demo@external")
+            .expect("plugin disable should succeed");
+
+        let loader = ConfigLoader::new(&workspace, &config_home);
+        let runtime_config = loader.load().expect("runtime config should load");
+        let report = render_hook_list_report_for(&workspace, &loader, &runtime_config)
+            .expect("hook list report should render");
+
+        assert!(report.contains("Hooks"));
+        assert!(report.contains("Registered       "));
+        assert!(report.contains("Enabled          "));
+        assert!(report.contains("yes     config"));
+        assert!(report.contains("PostToolUse"));
+        assert!(report.contains("printf 'config post'"));
+        assert!(report.contains("no      plugin:hook-report-demo@external"));
+        assert!(report.contains("PreToolUse"));
+        assert!(report.contains("hooks/pre.sh"));
+
+        let _ = fs::remove_dir_all(config_home);
+        let _ = fs::remove_dir_all(workspace);
+        let _ = fs::remove_dir_all(source_root);
     }
 
     #[test]
@@ -10350,6 +10553,7 @@ UU conflicted.rs",
         print_help_to(&mut help).expect("help should render");
         let help = String::from_utf8(help).expect("help should be utf8");
         assert!(help.contains("claw config show"));
+        assert!(help.contains("claw hook list"));
         assert!(help.contains("claw branch delete"));
         assert!(help.contains("claw --resume [SESSION.jsonl|session-id|latest]"));
         assert!(help.contains("Use `latest` with --resume, /resume, or /session switch"));
