@@ -200,6 +200,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             permission_mode,
             output_format,
         } => print_status_snapshot(&model, permission_mode, output_format)?,
+        CliAction::ConfigShow { output_format } => print_config_json(output_format)?,
+        CliAction::HookList { output_format } => print_hook_list(output_format)?,
         CliAction::Sandbox { output_format } => print_sandbox_status_snapshot(output_format)?,
         CliAction::Prompt {
             prompt,
@@ -233,6 +235,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         CliAction::Doctor { output_format } => run_doctor(output_format)?,
         CliAction::State { output_format } => run_worker_state(output_format)?,
         CliAction::Init { output_format } => run_init(output_format)?,
+        CliAction::BranchDelete => print_branch_delete_report()?,
         CliAction::Export {
             session_reference,
             output_path,
@@ -296,6 +299,12 @@ enum CliAction {
     Sandbox {
         output_format: CliOutputFormat,
     },
+    ConfigShow {
+        output_format: CliOutputFormat,
+    },
+    HookList {
+        output_format: CliOutputFormat,
+    },
     Prompt {
         prompt: String,
         model: String,
@@ -325,6 +334,7 @@ enum CliAction {
         output_path: Option<PathBuf>,
         output_format: CliOutputFormat,
     },
+    BranchDelete,
     Repl {
         model: String,
         allowed_tools: Option<AllowedToolSet>,
@@ -534,6 +544,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
             args: join_optional_args(&rest[1..]),
             output_format,
         }),
+        "config" => parse_config_args(&rest[1..], output_format),
         "mcp" => Ok(CliAction::Mcp {
             args: join_optional_args(&rest[1..]),
             output_format,
@@ -557,9 +568,11 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
             }
         }
         "system-prompt" => parse_system_prompt_args(&rest[1..], output_format),
+        "hook" => parse_hook_args(&rest[1..], output_format),
         "login" => Ok(CliAction::Login { output_format }),
         "logout" => Ok(CliAction::Logout { output_format }),
         "init" => Ok(CliAction::Init { output_format }),
+        "branch" => parse_branch_args(&rest[1..]),
         "export" => parse_export_args(&rest[1..], output_format),
         "prompt" => {
             let prompt = rest[1..].join(" ");
@@ -621,7 +634,7 @@ fn parse_single_word_command_alias(
     permission_mode_override: Option<PermissionMode>,
     output_format: CliOutputFormat,
 ) -> Option<Result<CliAction, String>> {
-    if rest.len() != 1 {
+    if rest.len() != 1 || matches!(rest[0].as_str(), "branch" | "config" | "hook") {
         return None;
     }
 
@@ -646,6 +659,7 @@ fn bare_slash_command_guidance(command_name: &str) -> Option<String> {
         "dump-manifests"
             | "bootstrap-plan"
             | "agents"
+            | "config"
             | "mcp"
             | "skills"
             | "system-prompt"
@@ -1084,6 +1098,36 @@ fn parse_export_args(args: &[String], output_format: CliOutputFormat) -> Result<
         output_path,
         output_format,
     })
+}
+
+fn parse_config_args(args: &[String], output_format: CliOutputFormat) -> Result<CliAction, String> {
+    match args {
+        [] => Err("Usage: claw config show".to_string()),
+        [action] if action == "show" => Ok(CliAction::ConfigShow { output_format }),
+        [action, ..] => Err(format!(
+            "unknown config action: {action}. Usage: claw config show"
+        )),
+    }
+}
+
+fn parse_hook_args(args: &[String], output_format: CliOutputFormat) -> Result<CliAction, String> {
+    match args {
+        [] => Err("Usage: claw hook list".to_string()),
+        [action] if action == "list" => Ok(CliAction::HookList { output_format }),
+        [action, ..] => Err(format!(
+            "unknown hook action: {action}. Usage: claw hook list"
+        )),
+    }
+}
+
+fn parse_branch_args(args: &[String]) -> Result<CliAction, String> {
+    match args {
+        [] => Err("Usage: claw branch delete".to_string()),
+        [action] if action == "delete" => Ok(CliAction::BranchDelete),
+        [action, ..] => Err(format!(
+            "unknown branch action: {action}. Usage: claw branch delete"
+        )),
+    }
 }
 
 fn parse_resume_args(args: &[String], output_format: CliOutputFormat) -> Result<CliAction, String> {
@@ -2224,6 +2268,13 @@ impl GitWorkspaceSummary {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GitWorktreeEntry {
+    path: PathBuf,
+    branch: Option<String>,
+    is_current: bool,
+}
+
 #[cfg(test)]
 fn format_unknown_slash_command_message(name: &str) -> String {
     let suggestions = suggest_slash_commands(name);
@@ -2433,6 +2484,52 @@ fn parse_git_workspace_summary(status: Option<&str>) -> GitWorkspaceSummary {
     summary
 }
 
+fn parse_git_worktrees(output: &str, current_worktree: &Path) -> Vec<GitWorktreeEntry> {
+    let mut worktrees = Vec::new();
+    let mut current: Option<GitWorktreeEntry> = None;
+    let current_worktree = normalize_path_for_compare(current_worktree);
+
+    for line in output.lines().chain(std::iter::once("")) {
+        if line.is_empty() {
+            if let Some(worktree) = current.take() {
+                worktrees.push(worktree);
+            }
+            continue;
+        }
+
+        if let Some(path) = line.strip_prefix("worktree ") {
+            if let Some(worktree) = current.take() {
+                worktrees.push(worktree);
+            }
+            let path = PathBuf::from(path);
+            let is_current = normalize_path_for_compare(&path) == current_worktree;
+            current = Some(GitWorktreeEntry {
+                path,
+                branch: None,
+                is_current,
+            });
+            continue;
+        }
+
+        let Some(worktree) = current.as_mut() else {
+            continue;
+        };
+
+        if let Some(branch) = line.strip_prefix("branch ") {
+            worktree.branch = Some(
+                branch
+                    .strip_prefix("refs/heads/")
+                    .unwrap_or(branch)
+                    .to_string(),
+            );
+        } else if line == "detached" {
+            worktree.branch = Some("detached HEAD".to_string());
+        }
+    }
+
+    worktrees
+}
+
 fn resolve_git_branch_for(cwd: &Path) -> Option<String> {
     let branch = run_git_capture_in(cwd, &["branch", "--show-current"])?;
     let branch = branch.trim();
@@ -2451,6 +2548,15 @@ fn resolve_git_branch_for(cwd: &Path) -> Option<String> {
     }
 }
 
+fn git_ref_exists_in(cwd: &Path, reference: &str) -> bool {
+    std::process::Command::new("git")
+        .args(["rev-parse", "--verify", "--quiet", reference])
+        .current_dir(cwd)
+        .output()
+        .map(|output| output.status.success())
+        .unwrap_or(false)
+}
+
 fn run_git_capture_in(cwd: &Path, args: &[&str]) -> Option<String> {
     let output = std::process::Command::new("git")
         .args(args)
@@ -2461,6 +2567,10 @@ fn run_git_capture_in(cwd: &Path, args: &[&str]) -> Option<String> {
         return None;
     }
     String::from_utf8(output.stdout).ok()
+}
+
+fn normalize_path_for_compare(path: &Path) -> PathBuf {
+    path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
 }
 
 fn find_git_root_in(cwd: &Path) -> Result<PathBuf, Box<dyn std::error::Error>> {
@@ -4965,6 +5075,140 @@ fn print_help_topic(topic: LocalHelpTopic) {
     println!("{}", render_help_topic(topic));
 }
 
+fn print_config_json(_output_format: CliOutputFormat) -> Result<(), Box<dyn std::error::Error>> {
+    println!("{}", render_merged_runtime_config_json()?);
+    Ok(())
+}
+
+fn render_merged_runtime_config_json() -> Result<String, Box<dyn std::error::Error>> {
+    let cwd = env::current_dir()?;
+    let loader = ConfigLoader::default_for(&cwd);
+    let runtime_config = loader.load()?;
+    let parsed: serde_json::Value = serde_json::from_str(&runtime_config.as_json().render())?;
+    Ok(serde_json::to_string_pretty(&parsed)?)
+}
+
+fn print_hook_list(_output_format: CliOutputFormat) -> Result<(), Box<dyn std::error::Error>> {
+    let cwd = env::current_dir()?;
+    let loader = ConfigLoader::default_for(&cwd);
+    let runtime_config = loader.load()?;
+    println!(
+        "{}",
+        render_hook_list_report_for(&cwd, &loader, &runtime_config)?
+    );
+    Ok(())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct HookListEntry {
+    source: String,
+    event: &'static str,
+    command: String,
+    enabled: bool,
+}
+
+fn render_hook_list_report_for(
+    cwd: &Path,
+    loader: &ConfigLoader,
+    runtime_config: &runtime::RuntimeConfig,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let entries = collect_hook_list_entries(cwd, loader, runtime_config)?;
+    let enabled_count = entries.iter().filter(|entry| entry.enabled).count();
+    let mut lines = vec![format!(
+        "Hooks\n  Registered       {}\n  Enabled          {}",
+        entries.len(),
+        enabled_count
+    )];
+
+    if entries.is_empty() {
+        lines.push("  No hooks registered.".to_string());
+        return Ok(lines.join("\n"));
+    }
+
+    lines.push("Entries".to_string());
+    lines.push(format!(
+        "  {:<7} {:<32} {:<19} {}",
+        "Enabled", "Source", "Event", "Command"
+    ));
+
+    for entry in entries {
+        lines.push(format!(
+            "  {:<7} {:<32} {:<19} {}",
+            if entry.enabled { "yes" } else { "no" },
+            entry.source,
+            entry.event,
+            entry.command
+        ));
+    }
+
+    Ok(lines.join("\n"))
+}
+
+fn collect_hook_list_entries(
+    cwd: &Path,
+    loader: &ConfigLoader,
+    runtime_config: &runtime::RuntimeConfig,
+) -> Result<Vec<HookListEntry>, Box<dyn std::error::Error>> {
+    let mut entries = Vec::new();
+    extend_hook_list_entries(
+        &mut entries,
+        "config".to_string(),
+        true,
+        runtime_config.hooks().pre_tool_use(),
+        runtime_config.hooks().post_tool_use(),
+        runtime_config.hooks().post_tool_use_failure(),
+    );
+
+    let plugin_manager = build_plugin_manager(cwd, loader, runtime_config);
+    let plugin_registry = plugin_manager.plugin_registry()?;
+    for plugin in plugin_registry.plugins() {
+        extend_hook_list_entries(
+            &mut entries,
+            format!("plugin:{}", plugin.metadata().id),
+            plugin.is_enabled(),
+            &plugin.hooks().pre_tool_use,
+            &plugin.hooks().post_tool_use,
+            &plugin.hooks().post_tool_use_failure,
+        );
+    }
+
+    Ok(entries)
+}
+
+fn extend_hook_list_entries(
+    entries: &mut Vec<HookListEntry>,
+    source: String,
+    enabled: bool,
+    pre_tool_use: &[String],
+    post_tool_use: &[String],
+    post_tool_use_failure: &[String],
+) {
+    append_hook_list_entries(entries, &source, enabled, "PreToolUse", pre_tool_use);
+    append_hook_list_entries(entries, &source, enabled, "PostToolUse", post_tool_use);
+    append_hook_list_entries(
+        entries,
+        &source,
+        enabled,
+        "PostToolUseFailure",
+        post_tool_use_failure,
+    );
+}
+
+fn append_hook_list_entries(
+    entries: &mut Vec<HookListEntry>,
+    source: &str,
+    enabled: bool,
+    event: &'static str,
+    commands: &[String],
+) {
+    entries.extend(commands.iter().cloned().map(|command| HookListEntry {
+        source: source.to_string(),
+        event,
+        command,
+        enabled,
+    }));
+}
+
 fn render_config_report(section: Option<&str>) -> Result<String, Box<dyn std::error::Error>> {
     let cwd = env::current_dir()?;
     let loader = ConfigLoader::default_for(&cwd);
@@ -5323,6 +5567,122 @@ fn format_issue_report(context: Option<&str>) -> String {
     )
 }
 
+fn format_branch_delete_report(
+    repo_root: &Path,
+    current_branch: &str,
+    default_branch: Option<&str>,
+    deleted_branches: &[String],
+) -> String {
+    let result = if deleted_branches.is_empty() {
+        "no merged local branches were eligible for deletion".to_string()
+    } else {
+        format!("deleted {} merged local branch(es)", deleted_branches.len())
+    };
+    let deleted = if deleted_branches.is_empty() {
+        "none".to_string()
+    } else {
+        deleted_branches.join(", ")
+    };
+
+    format!(
+        "Branch cleanup
+  Repository       {}
+  Current branch   {}
+  Protected branch {}
+  Deleted          {}
+  Result           {}",
+        repo_root.display(),
+        current_branch,
+        default_branch.unwrap_or("none"),
+        deleted,
+        result,
+    )
+}
+
+fn print_branch_delete_report() -> Result<(), Box<dyn std::error::Error>> {
+    let cwd = env::current_dir()?;
+    println!("{}", delete_merged_local_branches_in(&cwd)?);
+    Ok(())
+}
+
+fn delete_merged_local_branches_in(cwd: &Path) -> Result<String, Box<dyn std::error::Error>> {
+    let repo_root = find_git_root_in(cwd)?;
+    let current_branch =
+        resolve_git_branch_for(cwd).ok_or("unable to resolve the current git branch")?;
+    if current_branch == "detached HEAD" {
+        return Err("cannot delete merged branches from detached HEAD".into());
+    }
+
+    let default_branch = resolve_default_branch_name(&repo_root);
+    let mut protected_branches = branches_checked_out_in_worktrees(&repo_root);
+    protected_branches.insert(current_branch.clone());
+    if let Some(branch) = default_branch.as_ref() {
+        protected_branches.insert(branch.clone());
+    }
+
+    let merged_branches = list_merged_local_branches(&repo_root)?;
+    let deleted_branches = merged_branches
+        .into_iter()
+        .filter(|branch| !protected_branches.contains(branch))
+        .map(|branch| {
+            git_status_ok_in(&repo_root, &["branch", "-d", &branch])?;
+            Ok(branch)
+        })
+        .collect::<Result<Vec<_>, Box<dyn std::error::Error>>>()?;
+
+    Ok(format_branch_delete_report(
+        &repo_root,
+        &current_branch,
+        default_branch.as_deref(),
+        &deleted_branches,
+    ))
+}
+
+fn resolve_default_branch_name(cwd: &Path) -> Option<String> {
+    run_git_capture_in(
+        cwd,
+        &["symbolic-ref", "--quiet", "refs/remotes/origin/HEAD"],
+    )
+    .as_deref()
+    .and_then(|remote_head| {
+        remote_head
+            .trim()
+            .strip_prefix("refs/remotes/origin/")
+            .map(str::to_string)
+    })
+    .or_else(|| {
+        ["main", "master"]
+            .into_iter()
+            .find(|branch| git_ref_exists_in(cwd, &format!("refs/heads/{branch}")))
+            .map(str::to_string)
+    })
+}
+
+fn branches_checked_out_in_worktrees(cwd: &Path) -> std::collections::HashSet<String> {
+    let Some(output) = run_git_capture_in(cwd, &["worktree", "list", "--porcelain"]) else {
+        return std::collections::HashSet::new();
+    };
+
+    parse_git_worktrees(&output, cwd)
+        .into_iter()
+        .filter_map(|entry| match entry.branch {
+            Some(branch) if branch != "detached HEAD" => Some(branch),
+            _ => None,
+        })
+        .collect()
+}
+
+fn list_merged_local_branches(cwd: &Path) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+    let output = run_git_capture_in(cwd, &["branch", "--format=%(refname:short)", "--merged"])
+        .ok_or("failed to enumerate merged local branches")?;
+    Ok(output
+        .lines()
+        .map(str::trim)
+        .filter(|branch| !branch.is_empty())
+        .map(str::to_string)
+        .collect())
+}
+
 fn git_output(args: &[&str]) -> Result<String, Box<dyn std::error::Error>> {
     let output = Command::new("git")
         .args(args)
@@ -5336,10 +5696,12 @@ fn git_output(args: &[&str]) -> Result<String, Box<dyn std::error::Error>> {
 }
 
 fn git_status_ok(args: &[&str]) -> Result<(), Box<dyn std::error::Error>> {
-    let output = Command::new("git")
-        .args(args)
-        .current_dir(env::current_dir()?)
-        .output()?;
+    let cwd = env::current_dir()?;
+    git_status_ok_in(&cwd, args)
+}
+
+fn git_status_ok_in(cwd: &Path, args: &[&str]) -> Result<(), Box<dyn std::error::Error>> {
+    let output = Command::new("git").args(args).current_dir(cwd).output()?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
         return Err(format!("git {} failed: {stderr}", args.join(" ")).into());
@@ -7703,6 +8065,13 @@ fn print_help_to(out: &mut impl Write) -> io::Result<()> {
         out,
         "      Show the current local workspace status snapshot"
     )?;
+    writeln!(out, "  claw config show")?;
+    writeln!(out, "      Print the merged runtime config as JSON")?;
+    writeln!(out, "  claw hook list")?;
+    writeln!(
+        out,
+        "      Show registered hooks and whether they are enabled"
+    )?;
     writeln!(out, "  claw sandbox")?;
     writeln!(out, "      Show the current sandbox isolation snapshot")?;
     writeln!(out, "  claw doctor")?;
@@ -7719,6 +8088,11 @@ fn print_help_to(out: &mut impl Write) -> io::Result<()> {
     writeln!(out, "  claw login")?;
     writeln!(out, "  claw logout")?;
     writeln!(out, "  claw init")?;
+    writeln!(out, "  claw branch delete")?;
+    writeln!(
+        out,
+        "      Delete merged local git branches except the current/default worktree branches"
+    )?;
     writeln!(
         out,
         "  claw export [PATH] [--session SESSION] [--output PATH]"
@@ -7797,6 +8171,9 @@ fn print_help_to(out: &mut impl Write) -> io::Result<()> {
         out,
         "  claw --resume {LATEST_SESSION_REFERENCE} /status /diff /export notes.txt"
     )?;
+    writeln!(out, "  claw config show")?;
+    writeln!(out, "  claw hook list")?;
+    writeln!(out, "  claw branch delete")?;
     writeln!(out, "  claw agents")?;
     writeln!(out, "  claw mcp show my-server")?;
     writeln!(out, "  claw /skills")?;
@@ -7830,27 +8207,28 @@ mod tests {
     use super::{
         build_runtime_plugin_state_with_loader, build_runtime_with_plugin_state,
         collect_session_prompt_history, create_managed_session_handle, describe_tool_progress,
-        filter_tool_specs, format_bughunter_report, format_commit_preflight_report,
-        format_commit_skipped_report, format_compact_report, format_connected_line,
-        format_cost_report, format_history_timestamp, format_internal_prompt_progress_line,
-        format_issue_report, format_model_report, format_model_switch_report,
-        format_permissions_report, format_permissions_switch_report, format_pr_report,
-        format_resume_report, format_status_report, format_tool_call_start, format_tool_result,
-        format_ultraplan_report, format_unknown_slash_command,
-        format_unknown_slash_command_message, format_user_visible_api_error,
+        delete_merged_local_branches_in, filter_tool_specs, format_bughunter_report,
+        format_commit_preflight_report, format_commit_skipped_report, format_compact_report,
+        format_connected_line, format_cost_report, format_history_timestamp,
+        format_internal_prompt_progress_line, format_issue_report, format_model_report,
+        format_model_switch_report, format_permissions_report, format_permissions_switch_report,
+        format_pr_report, format_resume_report, format_status_report, format_tool_call_start,
+        format_tool_result, format_ultraplan_report, format_unknown_slash_command,
+        format_unknown_slash_command_message, format_user_visible_api_error, git_ref_exists_in,
         merge_prompt_with_stdin, normalize_permission_mode, parse_args, parse_export_args,
         parse_git_status_branch, parse_git_status_metadata_for, parse_git_workspace_summary,
-        parse_history_count, permission_policy, print_help_to, push_output_block,
-        render_config_report, render_diff_report, render_diff_report_for, render_memory_report,
-        render_prompt_history_report, render_repl_help, render_resume_usage,
-        render_session_markdown, resolve_model_alias, resolve_model_alias_with_config,
-        resolve_repl_model, resolve_session_reference, response_to_events,
-        resume_supported_slash_commands, run_resume_command, short_tool_id,
+        parse_git_worktrees, parse_history_count, parse_hook_args, permission_policy, print_help_to,
+        push_output_block, render_config_report,
+        render_diff_report, render_diff_report_for, render_hook_list_report_for,
+        render_memory_report, render_merged_runtime_config_json, render_prompt_history_report,
+        render_repl_help, render_resume_usage, render_session_markdown, resolve_model_alias,
+        resolve_model_alias_with_config, resolve_repl_model, resolve_session_reference,
+        response_to_events, resume_supported_slash_commands, run_resume_command, short_tool_id,
         slash_command_completion_candidates_with_sessions, status_context,
         summarize_tool_payload_for_markdown, validate_no_args, write_mcp_server_fixture, CliAction,
-        CliOutputFormat, CliToolExecutor, GitWorkspaceSummary, InternalPromptProgressEvent,
-        InternalPromptProgressState, LiveCli, LocalHelpTopic, PromptHistoryEntry, SlashCommand,
-        StatusUsage, DEFAULT_MODEL, LATEST_SESSION_REFERENCE,
+        CliOutputFormat, CliToolExecutor, GitWorkspaceSummary, GitWorktreeEntry,
+        InternalPromptProgressEvent, InternalPromptProgressState, LiveCli, LocalHelpTopic,
+        PromptHistoryEntry, SlashCommand, StatusUsage, DEFAULT_MODEL, LATEST_SESSION_REFERENCE,
     };
     use api::{ApiError, MessageResponse, OutputContentBlock, Usage};
     use plugins::{
@@ -8786,6 +9164,55 @@ mod tests {
     }
 
     #[test]
+    fn parses_branch_delete_subcommand() {
+        assert_eq!(
+            parse_args(&["branch".to_string(), "delete".to_string()])
+                .expect("branch delete should parse"),
+            CliAction::BranchDelete
+        );
+    }
+
+    #[test]
+    fn branch_subcommand_requires_delete_action() {
+        let usage_error =
+            parse_args(&["branch".to_string()]).expect_err("branch should require an action");
+        assert!(usage_error.contains("Usage: claw branch delete"));
+
+        let unknown_error = parse_args(&["branch".to_string(), "prune".to_string()])
+            .expect_err("unknown branch action should fail");
+        assert!(unknown_error.contains("unknown branch action: prune"));
+        assert!(unknown_error.contains("Usage: claw branch delete"));
+    }
+    #[test]
+    fn parses_config_show_subcommand() {
+        assert_eq!(
+            parse_args(&["config".to_string(), "show".to_string()])
+                .expect("config show should parse"),
+            CliAction::ConfigShow {
+                output_format: CliOutputFormat::Text,
+            }
+        );
+
+        let error = parse_args(&["config".to_string()]).expect_err("missing action should fail");
+        assert!(error.contains("Usage: claw config show"));
+    }
+    #[test]
+    fn parses_hook_list_subcommand() {
+        assert_eq!(
+            parse_args(&["hook".to_string(), "list".to_string()]).expect("hook list should parse"),
+            CliAction::HookList {
+                output_format: CliOutputFormat::Text,
+            }
+        );
+
+        let error = parse_args(&["hook".to_string()]).expect_err("missing action should fail");
+        assert!(error.contains("Usage: claw hook list"));
+
+        let error = parse_hook_args(&["run".to_string()], CliOutputFormat::Text)
+            .expect_err("unknown action should fail");
+        assert!(error.contains("unknown hook action: run"));
+        assert!(error.contains("Usage: claw hook list"));
+    }
     fn parses_single_word_command_aliases_without_falling_back_to_prompt_mode() {
         let _guard = env_lock();
         std::env::remove_var("RUSTY_CLAUDE_PERMISSION_MODE");
@@ -9651,6 +10078,7 @@ mod tests {
         assert!(help.contains("claw help"));
         assert!(help.contains("claw version"));
         assert!(help.contains("claw status"));
+        assert!(help.contains("claw hook list"));
         assert!(help.contains("claw sandbox"));
         assert!(help.contains("claw init"));
         assert!(help.contains("claw agents"));
@@ -9807,6 +10235,16 @@ mod tests {
     }
 
     #[test]
+    fn merged_runtime_config_json_renders_pretty_valid_json() {
+        let rendered =
+            render_merged_runtime_config_json().expect("runtime config json should render");
+        let parsed: serde_json::Value =
+            serde_json::from_str(&rendered).expect("runtime config json should parse");
+        assert!(parsed.is_object());
+        assert!(rendered.starts_with("{\n") || rendered == "{}");
+    }
+
+    #[test]
     fn memory_report_uses_sectioned_layout() {
         let report = render_memory_report().expect("memory report should render");
         assert!(report.contains("Memory"));
@@ -9821,6 +10259,49 @@ mod tests {
         assert!(report.contains("Config"));
         assert!(report.contains("Discovered files"));
         assert!(report.contains("Merged JSON"));
+    }
+
+    #[test]
+    fn hook_list_report_shows_config_and_plugin_hooks_with_enabled_state() {
+        let config_home = temp_dir();
+        let workspace = temp_dir();
+        let source_root = temp_dir();
+        fs::create_dir_all(&config_home).expect("config home");
+        fs::create_dir_all(workspace.join(".claw")).expect("workspace config dir");
+        fs::create_dir_all(&source_root).expect("source root");
+        fs::write(
+            workspace.join(".claw").join("settings.json"),
+            r#"{"hooks":{"PostToolUse":["printf 'config post'"]}}"#,
+        )
+        .expect("workspace settings should write");
+        write_plugin_fixture(&source_root, "hook-report-demo", true, false);
+
+        let mut manager = PluginManager::new(PluginManagerConfig::new(&config_home));
+        manager
+            .install(source_root.to_str().expect("utf8 source path"))
+            .expect("plugin install should succeed");
+        manager
+            .disable("hook-report-demo@external")
+            .expect("plugin disable should succeed");
+
+        let loader = ConfigLoader::new(&workspace, &config_home);
+        let runtime_config = loader.load().expect("runtime config should load");
+        let report = render_hook_list_report_for(&workspace, &loader, &runtime_config)
+            .expect("hook list report should render");
+
+        assert!(report.contains("Hooks"));
+        assert!(report.contains("Registered       "));
+        assert!(report.contains("Enabled          "));
+        assert!(report.contains("yes     config"));
+        assert!(report.contains("PostToolUse"));
+        assert!(report.contains("printf 'config post'"));
+        assert!(report.contains("no      plugin:hook-report-demo@external"));
+        assert!(report.contains("PreToolUse"));
+        assert!(report.contains("hooks/pre.sh"));
+
+        let _ = fs::remove_dir_all(config_home);
+        let _ = fs::remove_dir_all(workspace);
+        let _ = fs::remove_dir_all(source_root);
     }
 
     #[test]
@@ -9976,6 +10457,92 @@ UU conflicted.rs",
     }
 
     #[test]
+    fn branch_delete_removes_only_merged_unprotected_local_branches() {
+        let _guard = cwd_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let workspace = temp_workspace("branch-delete");
+        std::fs::create_dir_all(&workspace).expect("workspace should create");
+        let previous = std::env::current_dir().expect("cwd");
+        std::env::set_current_dir(&workspace).expect("switch cwd");
+
+        git(&["init", "--quiet", "-b", "main"], &workspace);
+        git(&["config", "user.email", "tests@example.com"], &workspace);
+        git(&["config", "user.name", "Rusty Claude Tests"], &workspace);
+        std::fs::write(workspace.join("tracked.txt"), "base\n").expect("write tracked file");
+        git(&["add", "tracked.txt"], &workspace);
+        git(&["commit", "-m", "init", "--quiet"], &workspace);
+
+        git(&["checkout", "-b", "delete-me"], &workspace);
+        std::fs::write(workspace.join("tracked.txt"), "base\ndelete me\n")
+            .expect("update delete-me");
+        git(&["commit", "-am", "delete-me", "--quiet"], &workspace);
+        git(&["checkout", "main"], &workspace);
+        git(
+            &[
+                "merge",
+                "--no-ff",
+                "delete-me",
+                "-m",
+                "merge delete-me",
+                "--quiet",
+            ],
+            &workspace,
+        );
+
+        git(&["checkout", "-b", "keep-worktree"], &workspace);
+        std::fs::write(workspace.join("tracked.txt"), "base\ndelete me\nkeep me\n")
+            .expect("update keep-worktree");
+        git(&["commit", "-am", "keep-worktree", "--quiet"], &workspace);
+        git(&["checkout", "main"], &workspace);
+        git(
+            &[
+                "merge",
+                "--no-ff",
+                "keep-worktree",
+                "-m",
+                "merge keep-worktree",
+                "--quiet",
+            ],
+            &workspace,
+        );
+
+        let linked_worktree = workspace.join("keep-worktree-linked");
+        git(
+            &[
+                "worktree",
+                "add",
+                "--force",
+                linked_worktree.to_str().expect("utf8 worktree path"),
+                "keep-worktree",
+            ],
+            &workspace,
+        );
+
+        let report =
+            delete_merged_local_branches_in(&workspace).expect("branch delete should succeed");
+        assert!(report.contains("Deleted          delete-me"));
+        assert!(report.contains("Protected branch main"));
+        assert!(git_ref_exists_in(&workspace, "refs/heads/main"));
+        assert!(!git_ref_exists_in(&workspace, "refs/heads/delete-me"));
+        assert!(git_ref_exists_in(&workspace, "refs/heads/keep-worktree"));
+
+        std::env::set_current_dir(previous).expect("restore cwd");
+        if linked_worktree.exists() {
+            git(
+                &[
+                    "worktree",
+                    "remove",
+                    "--force",
+                    linked_worktree.to_str().expect("utf8 worktree path"),
+                ],
+                &workspace,
+            );
+        }
+        std::fs::remove_dir_all(workspace).expect("workspace should clean up");
+    }
+
+    #[test]
     fn status_context_reads_real_workspace_metadata() {
         let context = status_context(None).expect("status context should load");
         assert!(context.cwd.is_absolute());
@@ -10050,6 +10617,9 @@ UU conflicted.rs",
         let mut help = Vec::new();
         print_help_to(&mut help).expect("help should render");
         let help = String::from_utf8(help).expect("help should be utf8");
+        assert!(help.contains("claw config show"));
+        assert!(help.contains("claw hook list"));
+        assert!(help.contains("claw branch delete"));
         assert!(help.contains("claw --resume [SESSION.jsonl|session-id|latest]"));
         assert!(help.contains("Use `latest` with --resume, /resume, or /session switch"));
         assert!(help.contains("claw --resume latest"));

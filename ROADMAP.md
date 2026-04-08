@@ -348,6 +348,8 @@ Priority order: P0 = blocks CI/green state, P1 = blocks integration wiring, P2 =
 
     **Status.** A `workspace_root` field has been added to `Session` in `rust/crates/runtime/src/session.rs` (with builder, accessor, JSON + JSONL round-trip, fork inheritance, and given/when/then test coverage in `persists_workspace_root_round_trip_and_forks_inherit_it`). The CWD validation, the namespaced on-disk path, and the `branch.workspace_mismatch` lane event are still outstanding and tracked under this item.
 
+16. **Commit provenance / worktree-aware push events** — clawhip build stream shows duplicate-looking commit messages and worktree-originated pushes without clear supersession indicators; add worktree/branch metadata to push events and de-dup superseded commits in build stream display
+
 **P3 — Swarm efficiency**
 13. Swarm branch-lock protocol — **done**: `branch_lock::detect_branch_lock_collisions()` now detects same-branch/same-scope and nested-module collisions before parallel lanes drift into duplicate implementation
 14. Commit provenance / worktree-aware push events — **done**: lane event provenance now includes branch/worktree/superseded/canonical lineage metadata, and manifest persistence de-dupes superseded commit events before downstream consumers render them
