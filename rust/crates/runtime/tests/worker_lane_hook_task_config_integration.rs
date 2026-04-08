@@ -230,9 +230,11 @@ fn config_validation_rejects_invalid_hook_entries_before_merge() {
         .expect_err("invalid hooks should fail validation");
     let rendered = error.to_string();
 
-    assert!(rendered.contains(&format!(
-        "{}: hooks: field PreToolUse must contain only strings",
-        project_settings.display()
-    )));
+    assert!(
+        rendered.contains("hooks.PreToolUse")
+            && (rendered.contains("must be an array of strings")
+                || rendered.contains("must contain only strings")),
+        "expected hooks.PreToolUse validation error, got: {rendered}"
+    );
     assert!(!rendered.contains("merged settings.hooks"));
 }

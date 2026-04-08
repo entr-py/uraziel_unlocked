@@ -2268,6 +2268,13 @@ impl GitWorkspaceSummary {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GitWorktreeEntry {
+    path: PathBuf,
+    branch: Option<String>,
+    is_current: bool,
+}
+
 #[cfg(test)]
 fn format_unknown_slash_command_message(name: &str) -> String {
     let suggestions = suggest_slash_commands(name);
@@ -2477,6 +2484,52 @@ fn parse_git_workspace_summary(status: Option<&str>) -> GitWorkspaceSummary {
     summary
 }
 
+fn parse_git_worktrees(output: &str, current_worktree: &Path) -> Vec<GitWorktreeEntry> {
+    let mut worktrees = Vec::new();
+    let mut current: Option<GitWorktreeEntry> = None;
+    let current_worktree = normalize_path_for_compare(current_worktree);
+
+    for line in output.lines().chain(std::iter::once("")) {
+        if line.is_empty() {
+            if let Some(worktree) = current.take() {
+                worktrees.push(worktree);
+            }
+            continue;
+        }
+
+        if let Some(path) = line.strip_prefix("worktree ") {
+            if let Some(worktree) = current.take() {
+                worktrees.push(worktree);
+            }
+            let path = PathBuf::from(path);
+            let is_current = normalize_path_for_compare(&path) == current_worktree;
+            current = Some(GitWorktreeEntry {
+                path,
+                branch: None,
+                is_current,
+            });
+            continue;
+        }
+
+        let Some(worktree) = current.as_mut() else {
+            continue;
+        };
+
+        if let Some(branch) = line.strip_prefix("branch ") {
+            worktree.branch = Some(
+                branch
+                    .strip_prefix("refs/heads/")
+                    .unwrap_or(branch)
+                    .to_string(),
+            );
+        } else if line == "detached" {
+            worktree.branch = Some("detached HEAD".to_string());
+        }
+    }
+
+    worktrees
+}
+
 fn resolve_git_branch_for(cwd: &Path) -> Option<String> {
     let branch = run_git_capture_in(cwd, &["branch", "--show-current"])?;
     let branch = branch.trim();
@@ -2495,6 +2548,15 @@ fn resolve_git_branch_for(cwd: &Path) -> Option<String> {
     }
 }
 
+fn git_ref_exists_in(cwd: &Path, reference: &str) -> bool {
+    std::process::Command::new("git")
+        .args(["rev-parse", "--verify", "--quiet", reference])
+        .current_dir(cwd)
+        .output()
+        .map(|output| output.status.success())
+        .unwrap_or(false)
+}
+
 fn run_git_capture_in(cwd: &Path, args: &[&str]) -> Option<String> {
     let output = std::process::Command::new("git")
         .args(args)
@@ -2505,6 +2567,10 @@ fn run_git_capture_in(cwd: &Path, args: &[&str]) -> Option<String> {
         return None;
     }
     String::from_utf8(output.stdout).ok()
+}
+
+fn normalize_path_for_compare(path: &Path) -> PathBuf {
+    path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
 }
 
 fn find_git_root_in(cwd: &Path) -> Result<PathBuf, Box<dyn std::error::Error>> {
@@ -8151,8 +8217,8 @@ mod tests {
         format_unknown_slash_command_message, format_user_visible_api_error, git_ref_exists_in,
         merge_prompt_with_stdin, normalize_permission_mode, parse_args, parse_export_args,
         parse_git_status_branch, parse_git_status_metadata_for, parse_git_workspace_summary,
-        parse_git_worktrees, parse_history_count, parse_hook_args, parse_recent_commits,
-        permission_policy, print_help_to, push_output_block, render_config_report,
+        parse_git_worktrees, parse_history_count, parse_hook_args, permission_policy, print_help_to,
+        push_output_block, render_config_report,
         render_diff_report, render_diff_report_for, render_hook_list_report_for,
         render_memory_report, render_merged_runtime_config_json, render_prompt_history_report,
         render_repl_help, render_resume_usage, render_session_markdown, resolve_model_alias,
@@ -8160,10 +8226,9 @@ mod tests {
         response_to_events, resume_supported_slash_commands, run_resume_command, short_tool_id,
         slash_command_completion_candidates_with_sessions, status_context,
         summarize_tool_payload_for_markdown, validate_no_args, write_mcp_server_fixture, CliAction,
-        CliOutputFormat, CliToolExecutor, GitBranchFreshness, GitCommitEntry,
-        GitWorkspaceSummary, GitWorktreeEntry, InternalPromptProgressEvent,
-        InternalPromptProgressState, LiveCli, LocalHelpTopic, PromptHistoryEntry, SlashCommand,
-        StatusUsage, DEFAULT_MODEL, LATEST_SESSION_REFERENCE,
+        CliOutputFormat, CliToolExecutor, GitWorkspaceSummary, GitWorktreeEntry,
+        InternalPromptProgressEvent, InternalPromptProgressState, LiveCli, LocalHelpTopic,
+        PromptHistoryEntry, SlashCommand, StatusUsage, DEFAULT_MODEL, LATEST_SESSION_REFERENCE,
     };
     use api::{ApiError, MessageResponse, OutputContentBlock, Usage};
     use plugins::{
